@@ -1,133 +1,223 @@
+"""Export the full MITRE ATT&CK Enterprise technique catalogue to a spreadsheet."""
+
+import argparse
+import csv
+import re
+import sys
+import time
+
 import requests
 from bs4 import BeautifulSoup
-import openpyxl
-import time  # Add time module for sleep functionality
 
-lista_ids = []
-last_technique = ""
-dic_final = {}
+BASE_URL = "https://attack.mitre.org"
+INDEX_URL = f"{BASE_URL}/techniques/enterprise/"
+USER_AGENT = "ttps-magician (https://github.com/fsola99/ttps-magician)"
 
-# Función para obtener la información de una técnica o sub-técnica
+COLUMNS = ["ID", "Name", "Tactics", "Platforms", "Description", "URL"]
+
+_WHITESPACE = re.compile(r"\s+")
 
 
-def obtener_info(item, souper):
-    title = souper.find("h1")
-    title_name = title.text.strip()
+def tidy(text):
+    """Return `text` with every run of whitespace collapsed to a single space."""
+    return _WHITESPACE.sub(" ", text.replace("\xa0", " ")).strip()
 
-    if ":" in title_name:
-        title_splitted = title_name.split(":")
-        sin_espacio = title_splitted[1].lstrip()
 
-        title_final = title_splitted[0] + " " + sin_espacio
-    else:
-        title_final = title_name
+def fetch(session, url, attempts, delay):
+    """Return the parsed page at `url`, or None once `attempts` tries have failed.
 
-    print(title_final)
+    Waits `delay` seconds before returning, so callers stay within a polite request rate
+    whatever the outcome. Each retry waits progressively longer.
+    """
+    reason = "no attempt was made"
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.get(url, timeout=30)
+            if response.status_code == 200:
+                time.sleep(delay)
+                return BeautifulSoup(response.content, "html.parser")
+            reason = f"HTTP {response.status_code}"
+        except requests.RequestException as error:
+            reason = str(error)
 
-    description = souper.find("div", {"class": "description-body"})
-    description_text = description.text.strip() if description else 'No description available'
+        if attempt < attempts:
+            backoff = delay * 2 * attempt
+            print(f"    retrying after {reason}, waiting {backoff:.0f}s")
+            time.sleep(backoff)
 
-    # Plataformas
-    divs_plataformas = souper.find_all('div', class_='row card-data')
-    # Iterar sobre los divs de las plataformas
-    for div_plataformas in divs_plataformas:
-        # Encontrar el span que contiene el título 'Platforms:'
-        span_titulo = div_plataformas.find('span', class_='h5 card-title')
+    print(f"    giving up on {url}: {reason}")
+    time.sleep(delay)
+    return None
 
-        if span_titulo and span_titulo.text.strip() == 'Platforms:':
-            # Obtener el valor de las plataformas
-            plataformas_feo = div_plataformas.find('div', class_='col-md-11 pl-0').text.strip()  # Platforms: Azure AD, Google Workspace, IaaS, Linux, Office 365, SaaS, Windows, macOS
-            plataformas = plataformas_feo[11:]
 
-    dic_final[item] = {
-        'name': title_final,
-        'description': description_text,
-        'platforms': plataformas,
+def technique_ids(index_page):
+    """Return every technique and sub-technique ID listed on the Enterprise index.
+
+    Sub-technique rows carry only the `.001` suffix, so each is joined to the technique
+    heading it appeared under, giving IDs of the form `T1059.001`.
+    """
+    table = index_page.find("table", {"class": "table-techniques"})
+    if table is None:
+        return []
+
+    ids = []
+    parent_id = ""
+    for row in table.find_all("tr"):
+        classes = row.get("class", [])
+        cells = row.find_all("td")
+        if "sub" in classes:
+            if len(cells) >= 2:
+                ids.append(parent_id + cells[1].text.strip())
+        elif "technique" in classes and cells:
+            parent_id = cells[0].text.strip()
+            ids.append(parent_id)
+    return ids
+
+
+def card_fields(page):
+    """Return the technique page's side-card fields, keyed by label without its colon."""
+    fields = {}
+    for card in page.find_all("div", class_="row card-data"):
+        label = card.find("span", class_="h5 card-title")
+        value = card.find("div", class_="col-md-11 pl-0")
+        if label is None or value is None:
+            continue
+        name = tidy(label.text).rstrip(":")
+        # The value block repeats the label, so drop everything up to the first colon.
+        fields[name] = tidy(value.text).split(":", 1)[-1].strip()
+    return fields
+
+
+def technique_url(attack_id):
+    """Return the ATT&CK page URL for a technique or sub-technique ID."""
+    return f"{BASE_URL}/techniques/{attack_id.replace('.', '/')}/"
+
+
+def technique_row(attack_id, page):
+    """Return one catalogue row for a technique or sub-technique page.
+
+    Fields ATT&CK omits for a given technique come back as empty strings.
+    """
+    heading = page.find("h1")
+    description = page.find("div", {"class": "description-body"})
+    fields = card_fields(page)
+
+    return {
+        "ID": attack_id,
+        "Name": tidy(heading.text) if heading else "",
+        "Tactics": fields.get("Tactic", fields.get("Tactics", "")),
+        "Platforms": fields.get("Platforms", ""),
+        "Description": tidy(description.text) if description else "",
+        "URL": technique_url(attack_id),
     }
 
-# Función para guardar los datos en un archivo Excel
+
+def write_csv(rows, path):
+    """Write `rows` to `path` as CSV."""
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def guardar_en_excel(diccionario, nombre_archivo):
-    # Crear un nuevo libro de trabajo y una hoja
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Técnicas MITRE"
+def write_xlsx(rows, path):
+    """Write `rows` to `path` as an Excel workbook.
 
-    # Escribir la fila de encabezado
-    ws.append(["ID", "Title", "Description", "Platforms"])
+    Raises SystemExit if openpyxl is unavailable.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        sys.exit("[x] openpyxl is needed for .xlsx output: pip install openpyxl "
+                 "(or pass an --output ending in .csv)")
 
-    # Escribir cada fila con la información de dic_final
-    for key, value in diccionario.items():
-        ws.append([key, value['name'], value['description'], value['platforms']])
-
-    # Guardar el archivo Excel
-    wb.save(nombre_archivo)
-    print(f"Archivo Excel guardado como {nombre_archivo}")
-
-# ---------------------- RECORRER MITRE ----------------------------------------
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "ATT&CK Techniques"
+    sheet.append(COLUMNS)
+    for row in rows:
+        sheet.append([row[column] for column in COLUMNS])
+    workbook.save(path)
 
 
-url = 'https://attack.mitre.org/techniques/enterprise/'
+def parse_args(argv=None):
+    """Return the parsed command line."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Export every MITRE ATT&CK Enterprise technique and sub-technique — id, "
+            "name, tactics, platforms and description — to a spreadsheet."
+        ),
+        epilog=(
+            "Around 700 pages are read, one request each, so a full run takes roughly "
+            "15 minutes at the default delay. Use --limit for a quick trial."
+        ),
+    )
+    parser.add_argument(
+        "-o", "--output", default="ttps.xlsx",
+        help="file to write; .csv writes CSV, anything else writes Excel (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-d", "--delay", type=float, default=1.0,
+        help="seconds to wait between requests (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-r", "--retries", type=int, default=2,
+        help="extra attempts per page before giving up on it (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-l", "--limit", type=int,
+        help="stop after this many techniques, for a quick trial run",
+    )
+    return parser.parse_args(argv)
 
-# Realizar la solicitud HTTP GET a la página
-response = requests.get(url)
 
-# Verificar si la solicitud fue exitosa
-if response.status_code == 200:
-    # Crear un objeto BeautifulSoup con el contenido HTML de la página
-    soup = BeautifulSoup(response.content, 'html.parser')
+def main(argv=None):
+    """Write the technique catalogue and return the process exit code."""
+    args = parse_args(argv)
 
-    # Encontrar la tabla que contiene las técnicas
-    table = soup.find('table', {"class": "table-techniques"})
+    session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
 
-    # Verificar si la tabla existe
-    if table:
-        # Recorrer todas las filas de la tabla
-        rows = table.find_all("tr")
+    print(f"[+] Reading the technique index from {INDEX_URL}")
+    index_page = fetch(session, INDEX_URL, args.retries + 1, args.delay)
+    if index_page is None:
+        print("[x] Could not read the technique index.")
+        return 1
 
-        for row in rows:
-            # Verificar si la fila es una técnica principal
-            if "technique" in row.get('class', []) and "sub" not in row.get('class', []):
-                # Obtener el ID de la técnica
-                id_cell = row.find('td')  # Asumimos que la segunda celda tiene el ID
-                if id_cell:
-                    technique_id = id_cell.text.strip()  # Obtener el ID de la técnica (por ejemplo, T1458)
+    ids = technique_ids(index_page)
+    if not ids:
+        print("[x] The technique index held no techniques. ATT&CK may have changed its markup.")
+        return 1
 
-                    last_technique = technique_id
-                    # Guardar la técnica en la lista
-                    lista_ids.append(technique_id)
-            elif "sub" in row.get('class', []):
-                subtech_id_cell = row.find_all('td')[1]
-                subtech_id = subtech_id_cell.text.strip()
-                lista_ids.append(last_technique + subtech_id)
-    print(lista_ids)
+    if args.limit:
+        ids = ids[: args.limit]
+    print(f"[+] {len(ids)} techniques and sub-techniques to read")
 
-# Procesar cada técnica y sub-técnica
-for item in lista_ids:
-    if '.' not in item:
-        url_id = "https://attack.mitre.org/techniques/" + item + "/"
-        print(url_id)
-        # Realizar la solicitud HTTP GET a la página
-        response_tec = requests.get(url_id)
-        if response_tec.status_code == 200:
-            soup_tec = BeautifulSoup(response_tec.content, 'html.parser')
-            obtener_info(item, soup_tec)
-        else:
-            print("No pude obtener técnica:", item)
-        time.sleep(1)  # Add 1 second sleep between requests
+    rows = []
+    missed = []
+    for position, attack_id in enumerate(ids, start=1):
+        page = fetch(session, technique_url(attack_id), args.retries + 1, args.delay)
+        if page is None:
+            missed.append(attack_id)
+            continue
+        row = technique_row(attack_id, page)
+        rows.append(row)
+        print(f"    [{position}/{len(ids)}] {attack_id} {row['Name']}")
+
+    if not rows:
+        print("[x] Nothing was read successfully.")
+        return 1
+
+    if args.output.lower().endswith(".csv"):
+        write_csv(rows, args.output)
     else:
-        x = item.split(".")
-        url_sub_id = "https://attack.mitre.org/techniques/" + x[0] + "/" + x[1]
-        # Realizar la solicitud HTTP GET a la página
-        response_sub = requests.get(url_sub_id)
-        if response_sub.status_code == 200:
-            soup_sub = BeautifulSoup(response_sub.content, 'html.parser')
-            obtener_info(item, soup_sub)
-        else:
-            print("No pude obtener sub-técnica:", item)
-        time.sleep(1)  # Add 1 second sleep between requests
+        write_xlsx(rows, args.output)
 
-# Guardar los resultados en un archivo Excel
-print(dic_final)
-guardar_en_excel(dic_final, "ttps.xlsx")
+    if missed:
+        print(f"[!] {len(missed)} pages were unreadable: {', '.join(missed)}")
+    print(f"[+] Done: {len(rows)} techniques in {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
